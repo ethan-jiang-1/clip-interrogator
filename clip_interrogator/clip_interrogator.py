@@ -16,6 +16,7 @@ from torchvision.transforms.functional import InterpolationMode
 from tqdm import tqdm
 from typing import List
 
+# this is v1
 
 @dataclass 
 class Config:
