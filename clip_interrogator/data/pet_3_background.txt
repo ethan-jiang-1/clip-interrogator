@@ -1,0 +1,47 @@
+laptop
+keyboard
+pc monitor
+desktop
+
+bed
+chair
+kennel
+Den
+
+living room
+sleeping room 
+bed room
+kitchen
+
+door
+floor
+wood floor
+concrete floor
+
+road
+ground
+snow ground 
+grassland
+pavements
+
+chair
+grey chair 
+black chair
+
+bottle
+paper
+book
+wood
+
+cloth 
+leash
+plate
+
+#padding
+#cigarette
+#lighter
+#bell 
+
+
+
+

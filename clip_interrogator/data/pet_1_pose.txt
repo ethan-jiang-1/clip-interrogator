@@ -1,0 +1,12 @@
+is running
+is walking
+is standing
+is sitting
+is laying
+is sleeping 
+is jumping
+is staring
+is awaking
+is opening mouth
+is hold in a arm 
+is hold in two arms 

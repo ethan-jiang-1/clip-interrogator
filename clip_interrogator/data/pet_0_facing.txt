@@ -1,0 +1,18 @@
+looking at camera
+looking up camera
+looking down camera
+facing back to camera
+facing back
+facing right
+facing left
+facing top
+facing down
+staring at ground 
+staring at desk
+staring at floor
+staring at sky
+starting outside of window
+starting outside of door
+looking out
+looking abroad
+peeping out
