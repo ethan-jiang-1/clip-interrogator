@@ -32,6 +32,8 @@ if os.path.isdir("/root/autodl-nas"):
 else:
     g_logger = logging.getLogger(__name__)
 
+class CMN:
+    ViT_L_14_OPENAI = 'ViT-L-14/openai'
 
 @dataclass 
 class Config:
@@ -47,11 +49,13 @@ class Config:
         blip_model_url: str = 'https://storage.googleapis.com/sfr-vision-language-research/BLIP/models/model_large_caption.pth'
     else:
         blip_model_url: str = f"{DIR_ROOT}/experiments/blip/model_large_caption.pth"
-    blip_num_beams: int = 8
+    #blip_num_beams: int = 8
+    blip_num_beams: int = 64
     blip_offload: bool = False
 
     # clip settings
-    clip_model_name: str = 'ViT-L-14/openai'
+    # clip_model_name: str = 'ViT-L-14/openai'
+    clip_model_name: str = CMN.ViT_L_14_OPENAI
     if DIR_ROOT is None:
         clip_model_path: str = None
     else:
@@ -68,6 +72,92 @@ class Config:
     flavor_intermediate_count: int = 2048
     quiet: bool = False # when quiet progress bars are not shown
     ci_mode: str = "blip:clip"
+
+    if clip_model_name != CMN.ViT_L_14_OPENAI:
+        chunk_size = 1024
+        flavor_intermediate_count = 1024
+
+class LabelTable():
+    def __init__(self, labels:List[str], desc:str, clip_model, tokenize, config: Config):
+        self.chunk_size = config.chunk_size
+        self.config = config
+        self.device = config.device
+        self.embeds = []
+        self.labels = labels
+        self.tokenize = tokenize
+        self.desc = desc
+
+        hash = hashlib.sha256(",".join(labels).encode()).hexdigest()
+
+        cache_filepath = None
+        if config.cache_path is not None and desc is not None:
+            os.makedirs(config.cache_path, exist_ok=True)
+            sanitized_name = config.clip_model_name.replace('/', '_').replace('@', '_')
+            cache_filepath = os.path.join(config.cache_path, f"{sanitized_name}_{desc}.pkl")
+            if desc is not None and os.path.exists(cache_filepath):
+                with open(cache_filepath, 'rb') as f:
+                    try:
+                        data = pickle.load(f)
+                        if data.get('hash') == hash:
+                            self.labels = data['labels']
+                            self.embeds = data['embeds']
+                            if self.device == 'cpu':
+                                self.embeds = [e.astype(np.float32) for e in self.embeds]
+                    except Exception as e:
+                        print(f"Error loading cached table {desc}: {e}")
+
+        if len(self.labels) != len(self.embeds):
+            self.embeds = []
+            chunks = np.array_split(self.labels, max(1, len(self.labels)/config.chunk_size))
+            for chunk in tqdm(chunks, desc=f"Preprocessing {desc}" if desc else None, disable=self.config.quiet):
+                text_tokens = self.tokenize(chunk).to(self.device)
+                with torch.no_grad(), torch.cuda.amp.autocast():
+                    text_features = clip_model.encode_text(text_tokens)
+                    text_features /= text_features.norm(dim=-1, keepdim=True)
+                    text_features = text_features.half().cpu().numpy()
+                for i in range(text_features.shape[0]):
+                    self.embeds.append(text_features[i])
+
+            if cache_filepath is not None:
+                with open(cache_filepath, 'wb') as f:
+                    pickle.dump({
+                        "labels": self.labels, 
+                        "embeds": self.embeds, 
+                        "hash": hash, 
+                        "model": config.clip_model_name
+                    }, f)
+    
+    def _rank(self, image_features: torch.Tensor, text_embeds: torch.Tensor, top_count: int = 1) -> str:
+        top_count = min(top_count, len(text_embeds))
+        text_embeds = torch.stack([torch.from_numpy(t) for t in text_embeds]).to(self.device)
+        with torch.cuda.amp.autocast():
+            similarity = image_features @ text_embeds.T
+        top_vals, top_labels = similarity.float().cpu().topk(top_count, dim=-1)
+        return [top_labels[0][i].numpy() for i in range(top_count)], top_vals
+
+    def rank(self, image_features: torch.Tensor, top_count: int = 1, need_vals: bool = False) -> List[str]:
+        if len(self.labels) <= self.chunk_size:
+            tops, top_vals = self._rank(image_features, self.embeds, top_count=top_count)
+            if need_vals:
+                return [self.labels[i] for i in tops], top_vals
+            return [self.labels[i] for i in tops]
+
+        num_chunks = int(math.ceil(len(self.labels)/self.chunk_size))
+        keep_per_chunk = int(self.chunk_size / num_chunks)
+
+        top_labels, top_embeds = [], []
+        for chunk_idx in tqdm(range(num_chunks), disable=self.config.quiet):
+            start = chunk_idx*self.chunk_size
+            stop = min(start+self.chunk_size, len(self.embeds))
+            tops, _ = self._rank(image_features, self.embeds[start:stop], top_count=keep_per_chunk)
+            top_labels.extend([self.labels[start+i] for i in tops])
+            top_embeds.extend([self.embeds[start+i] for i in tops])
+
+        tops, top_vals = self._rank(image_features, top_embeds, top_count=top_count)
+        if need_vals:
+            return [top_labels[i] for i in tops], top_vals
+        return [top_labels[i] for i in tops], top_vals
+
 
 class InterrogatorBase:
     def __init__(self, config: Config, logger: logging.Logger = g_logger):
@@ -315,8 +405,7 @@ class InterrogatorOrg(InterrogatorBase):
 class InterrogatorPet(InterrogatorBase):
     def __init__(self, config: Config, logger: logging.Logger = None):
         super(InterrogatorPet, self).__init__(config, logger=logger)
-
-        self.pet_lablels = []
+        self.pet_lablels:List[LabelTable] = []
         self._build_ci_pet_label_list(config)
 
     def _build_ci_pet_label_list(self, config:Config): 
@@ -348,7 +437,7 @@ class InterrogatorPet(InterrogatorBase):
         if not config.quiet:
             self.logger.info(f"Loaded CLIP label pet data in {end_time-start_time:.2f} seconds.")
 
-    def interrogate_full(self, image: Image) -> str:
+    def interrogate_full(self, image: Image, num_lables: int = 3) -> str:
         if self.clip_model is None:
             return self.interrogate_caption(image)
 
@@ -356,95 +445,22 @@ class InterrogatorPet(InterrogatorBase):
         image_features = self.image_to_features(image)
 
         prompt = caption
+        self.label_dict = {}
 
-        #pet_background = self.pet_background.rank(image_features, 3)
-        # pet_facing = self.pet_facing.rank(image_features, 1)[0]
-        # pet_lighting = self.pet_lighting.rank(image_features, 1)[0]
-        # pet_pose = self.pet_pose.rank(image_features, 1)[0]
-        # pet_shoot = self.pet_shoot.rank(image_features, 1)[0]
         for label_table in self.pet_lablels:
-            top_label = label_table.rank(image_features, 1)[0]
+            top_labels, top_vals = label_table.rank(image_features, num_lables, need_vals=True)
+            self.inspect_tops(caption, num_lables, label_table, top_labels, top_vals)
+            top_label = top_labels[0] # we only pick up top one
             if top_label is not None and len(top_label) != 0:
                 prompt += ", " + top_label
 
-        return _truncate_to_fit(prompt, self.tokenize)
+        return _truncate_to_fit(prompt, self.tokenize), self.label_dict
 
-
-class LabelTable():
-    def __init__(self, labels:List[str], desc:str, clip_model, tokenize, config: Config):
-        self.chunk_size = config.chunk_size
-        self.config = config
-        self.device = config.device
-        self.embeds = []
-        self.labels = labels
-        self.tokenize = tokenize
-
-        hash = hashlib.sha256(",".join(labels).encode()).hexdigest()
-
-        cache_filepath = None
-        if config.cache_path is not None and desc is not None:
-            os.makedirs(config.cache_path, exist_ok=True)
-            sanitized_name = config.clip_model_name.replace('/', '_').replace('@', '_')
-            cache_filepath = os.path.join(config.cache_path, f"{sanitized_name}_{desc}.pkl")
-            if desc is not None and os.path.exists(cache_filepath):
-                with open(cache_filepath, 'rb') as f:
-                    try:
-                        data = pickle.load(f)
-                        if data.get('hash') == hash:
-                            self.labels = data['labels']
-                            self.embeds = data['embeds']
-                            if self.device == 'cpu':
-                                self.embeds = [e.astype(np.float32) for e in self.embeds]
-                    except Exception as e:
-                        print(f"Error loading cached table {desc}: {e}")
-
-        if len(self.labels) != len(self.embeds):
-            self.embeds = []
-            chunks = np.array_split(self.labels, max(1, len(self.labels)/config.chunk_size))
-            for chunk in tqdm(chunks, desc=f"Preprocessing {desc}" if desc else None, disable=self.config.quiet):
-                text_tokens = self.tokenize(chunk).to(self.device)
-                with torch.no_grad(), torch.cuda.amp.autocast():
-                    text_features = clip_model.encode_text(text_tokens)
-                    text_features /= text_features.norm(dim=-1, keepdim=True)
-                    text_features = text_features.half().cpu().numpy()
-                for i in range(text_features.shape[0]):
-                    self.embeds.append(text_features[i])
-
-            if cache_filepath is not None:
-                with open(cache_filepath, 'wb') as f:
-                    pickle.dump({
-                        "labels": self.labels, 
-                        "embeds": self.embeds, 
-                        "hash": hash, 
-                        "model": config.clip_model_name
-                    }, f)
-    
-    def _rank(self, image_features: torch.Tensor, text_embeds: torch.Tensor, top_count: int = 1) -> str:
-        top_count = min(top_count, len(text_embeds))
-        text_embeds = torch.stack([torch.from_numpy(t) for t in text_embeds]).to(self.device)
-        with torch.cuda.amp.autocast():
-            similarity = image_features @ text_embeds.T
-        _, top_labels = similarity.float().cpu().topk(top_count, dim=-1)
-        return [top_labels[0][i].numpy() for i in range(top_count)]
-
-    def rank(self, image_features: torch.Tensor, top_count: int = 1) -> List[str]:
-        if len(self.labels) <= self.chunk_size:
-            tops = self._rank(image_features, self.embeds, top_count=top_count)
-            return [self.labels[i] for i in tops]
-
-        num_chunks = int(math.ceil(len(self.labels)/self.chunk_size))
-        keep_per_chunk = int(self.chunk_size / num_chunks)
-
-        top_labels, top_embeds = [], []
-        for chunk_idx in tqdm(range(num_chunks), disable=self.config.quiet):
-            start = chunk_idx*self.chunk_size
-            stop = min(start+self.chunk_size, len(self.embeds))
-            tops = self._rank(image_features, self.embeds[start:stop], top_count=keep_per_chunk)
-            top_labels.extend([self.labels[start+i] for i in tops])
-            top_embeds.extend([self.embeds[start+i] for i in tops])
-
-        tops = self._rank(image_features, top_embeds, top_count=top_count)
-        return [top_labels[i] for i in tops]
+    def inspect_tops(self, caption:str, num_lables: int, label_table: LabelTable, top_labels: List[str], top_vals: List[float]):
+        top_vals = top_vals.float().cpu().numpy().tolist()
+        desc = label_table.desc
+        print(desc, num_lables, top_labels, top_vals, caption) 
+        self.label_dict[desc] = (num_lables, top_labels, top_vals, caption) 
 
 
 def _load_list(data_path: str, filename: str) -> List[str]:
