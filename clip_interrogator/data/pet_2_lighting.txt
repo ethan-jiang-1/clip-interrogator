@@ -1,0 +1,6 @@
+bright light
+dark light
+regular light
+dim light
+outdoor light
+in-room light

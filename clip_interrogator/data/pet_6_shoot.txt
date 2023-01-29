@@ -1,0 +1,6 @@
+far shoot
+near shoot 
+head-to-head shoot
+top shoot 
+back shoot 
+parallel shoot
